@@ -55,11 +55,36 @@ def parse_excel(file_bytes, filename):
         file_bytes = BytesIO(file_bytes)
     df_raw = pd.read_excel(file_bytes, sheet_name=0, header=None)
 
-    date_row = df_raw.iloc[17]
-    version_labels = []
-    for col in [13, 11, 9, 7, 5]:
-        version_labels.append(parse_release_date(date_row.iloc[col] if col < len(date_row) else None))
+    date_row  = df_raw.iloc[17]
+    total_row = df_raw.iloc[18]
 
+    # --- Auto-detect version columns: row 17 cells containing "Released"
+    version_cols = sorted(
+        [c for c in range(len(date_row))
+         if pd.notna(date_row.iloc[c]) and 'released' in str(date_row.iloc[c]).lower()],
+        reverse=True   # highest index = oldest, lowest index = most recent
+    )
+
+    # --- Weekly cols: row 17 cells labelled Wk1–Wk4
+    wk_map = {}
+    for c in range(len(date_row)):
+        val = str(date_row.iloc[c]).strip()
+        if val in ['Wk1', 'Wk2', 'Wk3', 'Wk4']:
+            wk_map[val] = c
+
+    # --- Latest version = lowest-index col with non-zero total (handles unreleased months)
+    latest_col = min(version_cols)   # fallback: most recent = lowest col index
+    for c in sorted(version_cols):
+        if (pd.to_numeric(total_row.iloc[c], errors='coerce') or 0) > 0:
+            latest_col = c
+            break
+
+    first_col = max(version_cols)    # oldest = highest col index
+
+    # --- Version labels ordered oldest → newest
+    version_labels = [parse_release_date(date_row.iloc[c]) for c in sorted(version_cols, reverse=True)]
+
+    # --- Parse SKU rows
     raw = df_raw.iloc[19:].copy().reset_index(drop=True)
     raw.columns = range(raw.shape[1])
 
@@ -69,15 +94,23 @@ def parse_excel(file_bytes, filename):
     data['Star']        = raw[2].astype(str).str.strip()
     data['Segment']     = raw[3].astype(str).str.strip()
     data['Description'] = raw[4].astype(str).str.strip()
-    data['v1_final']    = pd.to_numeric(raw[5],  errors='coerce').fillna(0).astype(int)
-    data['v2']          = pd.to_numeric(raw[7],  errors='coerce').fillna(0).astype(int)
-    data['v3']          = pd.to_numeric(raw[9],  errors='coerce').fillna(0).astype(int)
-    data['v4']          = pd.to_numeric(raw[11], errors='coerce').fillna(0).astype(int)
-    data['v5_first']    = pd.to_numeric(raw[13], errors='coerce').fillna(0).astype(int)
-    data['Wk1'] = pd.to_numeric(raw[16], errors='coerce').fillna(0).astype(int) if raw.shape[1] > 16 else 0
-    data['Wk2'] = pd.to_numeric(raw[17], errors='coerce').fillna(0).astype(int) if raw.shape[1] > 17 else 0
-    data['Wk3'] = pd.to_numeric(raw[18], errors='coerce').fillna(0).astype(int) if raw.shape[1] > 18 else 0
-    data['Wk4'] = pd.to_numeric(raw[19], errors='coerce').fillna(0).astype(int) if raw.shape[1] > 19 else 0
+    data['v1_final']    = pd.to_numeric(raw[latest_col], errors='coerce').fillna(0).astype(int)
+    data['v5_first']    = pd.to_numeric(raw[first_col],  errors='coerce').fillna(0).astype(int)
+
+    # Intermediate versions for plan evolution chart
+    mid_cols = sorted([c for c in version_cols if c != latest_col and c != first_col])
+    data['_version_cols'] = str(version_cols)   # store for evolution chart
+    # Store all version totals as metadata on the df (via attrs)
+    all_version_cols = sorted(version_cols, reverse=True)  # old → new
+
+    data['Wk1'] = pd.to_numeric(raw[wk_map['Wk1']], errors='coerce').fillna(0).astype(int) if 'Wk1' in wk_map else 0
+    data['Wk2'] = pd.to_numeric(raw[wk_map['Wk2']], errors='coerce').fillna(0).astype(int) if 'Wk2' in wk_map else 0
+    data['Wk3'] = pd.to_numeric(raw[wk_map['Wk3']], errors='coerce').fillna(0).astype(int) if 'Wk3' in wk_map else 0
+    data['Wk4'] = pd.to_numeric(raw[wk_map['Wk4']], errors='coerce').fillna(0).astype(int) if 'Wk4' in wk_map else 0
+
+    # Store per-version columns for the evolution chart
+    for i, c in enumerate(all_version_cols):
+        data[f'ver_{i}'] = pd.to_numeric(raw[c], errors='coerce').fillna(0).astype(int)
 
     data = data[~data['MAT'].isin(['nan', 'NaN', '', 'None'])]
 
@@ -116,15 +149,19 @@ STATUS_COLOR = {'New':GREEN,'Increased':'#86efac','Unchanged':'#94a3b8','Decreas
 def fmt(n): return f"{int(n):,}"
 
 def plan_evolution_chart(df, version_labels):
-    versions = ['v5_first','v4','v3','v2','v1_final']
-    totals   = [df[v].sum() for v in versions]
+    # Use dynamically stored ver_N columns (ver_0 = oldest, ver_N = newest)
+    ver_cols = sorted([c for c in df.columns if str(c).startswith('ver_')],
+                      key=lambda x: int(x.split('_')[1]))
+    totals = [df[c].sum() for c in ver_cols]
+    # Trim version_labels to match available columns
+    labels = version_labels[-len(totals):]
     fig = go.Figure(go.Scatter(
-        x=version_labels, y=totals, mode='lines+markers+text',
+        x=labels, y=totals, mode='lines+markers+text',
         text=[fmt(t) for t in totals], textposition='top center',
         line=dict(color=BLUE, width=3), marker=dict(size=10, color=BLUE),
         fill='tozeroy', fillcolor='rgba(29,78,216,0.07)',
     ))
-    fig.update_layout(title='Plan Evolution — Total Units Across 5 Versions',
+    fig.update_layout(title='Plan Evolution — Total Units Across All Versions',
         xaxis_title='Version (chronological →)', yaxis_title='Total Units',
         yaxis_tickformat=',', height=340, margin=dict(t=45,b=30,l=60,r=20),
         plot_bgcolor='white', paper_bgcolor='white',
@@ -376,11 +413,13 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 with tab1:
     st.markdown("<div class='section-header'>Plan Evolution</div>", unsafe_allow_html=True)
     st.plotly_chart(plan_evolution_chart(df_f, version_labels), use_container_width=True)
-    versions = ['v5_first','v4','v3','v2','v1_final']
-    totals   = [df_f[v].sum() for v in versions]
+    ver_cols = sorted([c for c in df_f.columns if str(c).startswith('ver_')],
+                      key=lambda x: int(x.split('_')[1]))
+    totals   = [df_f[c].sum() for c in ver_cols]
+    labels   = version_labels[-len(totals):]
     chgs     = ['—'] + [f"{((totals[i]-totals[i-1])/totals[i-1]*100):+.1f}%" if totals[i-1] else '—'
                         for i in range(1, len(totals))]
-    st.dataframe(pd.DataFrame({'Version': version_labels, 'Total Units': [fmt(t) for t in totals],
+    st.dataframe(pd.DataFrame({'Version': labels, 'Total Units': [fmt(t) for t in totals],
         'Change vs Prev': chgs}), use_container_width=True, hide_index=True)
 
 with tab2:
